@@ -95,7 +95,7 @@ pm2 status
 echo ""
 echo "===== アプリケーションへのアクセス方法 ====="
 echo "以下のURLでアプリケーションにアクセスできます:"
-INSTANCE_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+INSTANCE_IP=$(curl ifconfig.me)
 echo "- http://$INSTANCE_IP:3000/ (ルートエンドポイント - アプリの動作確認)"
 echo "- http://$INSTANCE_IP:3000/health (ヘルスチェックエンドポイント)"
 echo "- http://$INSTANCE_IP:3000/system-info (システム情報エンドポイント)"

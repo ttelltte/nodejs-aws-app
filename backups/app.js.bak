@@ -1,0 +1,297 @@
+const express = require('express');
+const session = require('express-session');
+const RedisStore = require('connect-redis').default;
+const { createClient } = require('redis');
+const mysql = require('mysql2/promise');
+const fs = require('fs');
+const path = require('path');
+const { getParameters } = require('./aws-params');
+
+// 設定とグローバル変数
+let redisClient = null;
+let dbPool = null;
+const EFS_MOUNT_POINT = '/mnt/efs';
+
+// 起動時にAWSパラメータを取得し、アプリを初期化
+async function bootstrap() {
+  try {
+    // AWSパラメータの取得
+    const config = await getParameters();
+    console.log('設定を取得しました');
+    
+    // Expressアプリの初期化
+    const app = express();
+    app.use(express.json());
+    
+    // デバッグエンドポイント - すぐに応答を返す
+    app.get('/debug', (req, res) => {
+      res.json({
+        status: 'debug',
+        timestamp: new Date(),
+        environment: process.env.NODE_ENV
+      });
+    });
+    
+    // Redisクライアントの初期化
+    try {
+      console.log('Redisに接続しています...');
+      redisClient = createClient({
+        url: `redis://${config.elasticache_primary_endpoint}`,
+        socket: {
+          connectTimeout: 10000,
+          reconnectStrategy: (retries) => Math.min(retries * 100, 3000)
+        }
+      });
+      
+      redisClient.on('error', (err) => {
+        console.error('Redisエラー:', err);
+      });
+      
+      await redisClient.connect();
+      console.log('Redisに接続しました');
+      
+      // セッション設定
+      app.use(session({
+        store: new RedisStore({ client: redisClient }),
+        secret: 'your-secret-key', // 本番環境では環境変数やパラメータストアから取得すべき
+        resave: false,
+        saveUninitialized: false,
+        cookie: { secure: false, maxAge: 86400000 } // 24時間
+      }));
+    } catch (redisError) {
+      console.error('Redisへの接続に失敗しました:', redisError);
+      // Redisなしでもアプリを続行するためにセッションをメモリに保存
+      app.use(session({
+        secret: 'your-secret-key',
+        resave: false,
+        saveUninitialized: false,
+        cookie: { secure: false, maxAge: 86400000 }
+      }));
+    }
+    
+    // MySQLプールの初期化
+    try {
+      console.log('データベースに接続しています...');
+      dbPool = mysql.createPool({
+        host: config.aurora_writer_endpoint,
+        user: config.aurora_username,
+        password: config.aurora_password,
+        database: 'mysql', // 既存のデータベースを使用
+        waitForConnections: true,
+        connectionLimit: 10,
+        queueLimit: 0,
+        connectTimeout: 10000
+      });
+      
+      console.log('データベース接続プールを初期化しました');
+    } catch (dbError) {
+      console.error('データベース接続に失敗しました:', dbError);
+      // データベースエラーでもアプリを続行
+    }
+    
+    // EFSのマウント確認
+    let efsAvailable = false;
+    try {
+      if (fs.existsSync(EFS_MOUNT_POINT)) {
+        console.log(`EFSがマウントされています: ${EFS_MOUNT_POINT}`);
+        // ディレクトリが書き込み可能か確認
+        try {
+          const testFile = path.join(EFS_MOUNT_POINT, '.write-test');
+          fs.writeFileSync(testFile, 'test');
+          fs.unlinkSync(testFile);
+          app.use('/static', express.static(path.join(EFS_MOUNT_POINT, 'static')));
+          efsAvailable = true;
+        } catch (fsError) {
+          console.error(`EFSディレクトリに書き込みできません: ${EFS_MOUNT_POINT}`, fsError);
+        }
+      } else {
+        console.warn(`EFSのマウントが確認できません: ${EFS_MOUNT_POINT}`);
+      }
+    } catch (efsError) {
+      console.error('EFSチェック中にエラーが発生しました:', efsError);
+    }
+    
+    // 静的ファイル用のフォールバック
+    if (!efsAvailable) {
+      const localStaticDir = path.join(__dirname, 'static');
+      try {
+        if (!fs.existsSync(localStaticDir)) {
+          fs.mkdirSync(localStaticDir, { recursive: true });
+        }
+        app.use('/static', express.static(localStaticDir));
+        console.log(`ローカル静的ディレクトリを使用します: ${localStaticDir}`);
+      } catch (localFsError) {
+        console.error('ローカル静的ディレクトリの設定に失敗しました:', localFsError);
+      }
+    }
+    
+    // ルートエンドポイント
+    app.get('/', (req, res) => {
+      res.json({ message: 'Node.jsアプリケーションが動作中です' });
+    });
+    
+    // ヘルスチェック
+    app.get('/health', (req, res) => {
+      res.status(200).json({ status: 'up', timestamp: new Date() });
+    });
+    
+    // セッションテスト
+    app.get('/session-test', (req, res) => {
+      if (!req.session.views) {
+        req.session.views = 0;
+      }
+      req.session.views++;
+      
+      res.json({
+        message: 'セッションテスト',
+        views: req.session.views,
+        sessionID: req.session.id
+      });
+    });
+    
+    // システム状態確認
+    app.get('/system-info', async (req, res) => {
+      try {
+        // データベース接続テスト
+        let dbStatus = { status: 'unknown' };
+        if (dbPool) {
+          try {
+            const connection = await dbPool.getConnection();
+            const [rows] = await connection.query('SELECT 1 AS connection_test');
+            connection.release();
+            dbStatus = {
+              status: 'connected',
+              test: rows[0].connection_test === 1
+            };
+          } catch (dbError) {
+            dbStatus = {
+              status: 'error',
+              message: dbError.message
+            };
+          }
+        } else {
+          dbStatus = {
+            status: 'not_configured'
+          };
+        }
+        
+        // Redis接続テスト
+        let redisStatus = { status: 'unknown' };
+        if (redisClient && redisClient.isOpen) {
+          try {
+            const pong = await redisClient.ping();
+            redisStatus = {
+              status: 'connected',
+              test: pong === 'PONG'
+            };
+          } catch (redisError) {
+            redisStatus = {
+              status: 'error',
+              message: redisError.message
+            };
+          }
+        } else {
+          redisStatus = {
+            status: 'not_connected'
+          };
+        }
+        
+        // EFSアクセステスト
+        let efsStatus = { status: 'unknown' };
+        try {
+          if (fs.existsSync(EFS_MOUNT_POINT)) {
+            try {
+              const testFilePath = path.join(EFS_MOUNT_POINT, 'test-write.txt');
+              const timestamp = new Date().toISOString();
+              fs.writeFileSync(testFilePath, `EFS write test: ${timestamp}`);
+              const content = fs.readFileSync(testFilePath, 'utf8');
+              
+              efsStatus = {
+                status: 'available',
+                mountPoint: EFS_MOUNT_POINT,
+                writeTest: content.includes(timestamp)
+              };
+            } catch (writeError) {
+              efsStatus = {
+                status: 'mounted_but_not_writable',
+                mountPoint: EFS_MOUNT_POINT,
+                error: writeError.message
+              };
+            }
+          } else {
+            efsStatus = {
+              status: 'not_mounted',
+              mountPoint: EFS_MOUNT_POINT
+            };
+          }
+        } catch (efsError) {
+          efsStatus = {
+            status: 'error',
+            message: efsError.message
+          };
+        }
+        
+        // 結果を返す
+        res.json({
+          timestamp: new Date(),
+          hostname: require('os').hostname(),
+          database: dbStatus,
+          cache: redisStatus,
+          storage: efsStatus,
+          session: req.session ? { id: req.session.id } : null,
+          config: {
+            // 一部の設定情報（機密情報は除く）
+            nodeEnv: process.env.NODE_ENV,
+            port: process.env.PORT || 3000
+          }
+        });
+      } catch (error) {
+        console.error('システム情報の取得中にエラーが発生しました:', error);
+        res.status(500).json({ error: 'システム情報の取得中にエラーが発生しました' });
+      }
+    });
+    
+    // エラーハンドリング
+    app.use((err, req, res, next) => {
+      console.error('アプリケーションエラー:', err);
+      res.status(500).json({ error: 'サーバーエラーが発生しました' });
+    });
+    
+    // サーバー起動
+    const PORT = process.env.PORT || 3000;
+    const server = app.listen(PORT, '0.0.0.0', () => {
+      console.log(`サーバーが起動しました - ポート: ${PORT}`);
+    });
+    
+    server.on('error', (error) => {
+      console.error('サーバー起動エラー:', error);
+      process.exit(1);
+    });
+    
+  } catch (error) {
+    console.error('アプリケーションの起動に失敗しました:', error);
+    process.exit(1);
+  }
+}
+
+// プロセス終了時の処理
+process.on('SIGTERM', async () => {
+  console.log('SIGTERMを受信しました...');
+  if (redisClient && redisClient.isOpen) await redisClient.quit();
+  if (dbPool) await dbPool.end();
+  process.exit(0);
+});
+
+// プロセスエラー時の処理
+process.on('uncaughtException', (error) => {
+  console.error('未処理の例外が発生しました:', error);
+  // エラーログ保存のための処理をここに追加
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('未処理のPromise拒否が発生しました:', reason);
+  // エラーログ保存のための処理をここに追加
+});
+
+// アプリケーション起動
+bootstrap();

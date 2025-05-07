@@ -1,4 +1,3 @@
-// app.js
 const express = require('express');
 const session = require('express-session');
 const RedisStore = require('connect-redis').default;
@@ -7,8 +6,6 @@ const mysql = require('mysql2/promise');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
-
-const app = express();
 
 // グローバル変数
 let redisClient = null;
@@ -30,8 +27,14 @@ async function bootstrap() {
     console.log('設定:', config);
     
     // Expressの初期化
+    const app = express();
     app.use(express.json());
     app.use(express.urlencoded({ extended: true }));
+
+    // アクセスログの設定（ここに追加）
+    const morgan = require('morgan');
+    // カスタムフォーマットでアクセスログを出力
+    app.use(morgan(':remote-addr - :method :url :status :res[content-length] - :response-time ms [:date[iso]] :req[x-forwarded-for]'));
     
     // Redisクライアントの初期化
     redisClient = createClient({
@@ -81,7 +84,18 @@ async function bootstrap() {
       }
       req.session.views++;
       
-      const instanceId = process.env.HOSTNAME || require('os').hostname();
+      // EC2インスタンスIDの取得（IMDSv2対応）
+      let instanceId = 'Unknown';
+      try {
+        // IMDSv2トークンの取得
+        const token = require('child_process').execSync('curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60"').toString().trim();
+        
+        // トークンを使ってインスタンスIDを取得
+        instanceId = require('child_process').execSync(`curl -s -H "X-aws-ec2-metadata-token: ${token}" http://169.254.169.254/latest/meta-data/instance-id`).toString().trim();
+      } catch (err) {
+        console.error('インスタンスIDの取得に失敗:', err);
+        instanceId = require('os').hostname(); // フォールバックとしてホスト名を使用
+      }
       
       res.send(`
         <!DOCTYPE html>
@@ -99,16 +113,21 @@ async function bootstrap() {
             button { background-color: #007bff; color: white; border: none; padding: 8px 15px; border-radius: 4px; cursor: pointer; }
             button:hover { background-color: #0069d9; }
             .instance-info { background-color: #e9ecef; padding: 10px; border-radius: 4px; margin-bottom: 20px; }
+            .server-banner { background-color: #343a40; color: white; padding: 15px; border-radius: 4px; margin-bottom: 20px; text-align: center; font-size: 1.2em; }
           </style>
         </head>
         <body>
+          <div class="server-banner">
+            <h2>インスタンスID: ${instanceId}</h2>
+          </div>
+          
           <h1>AWS コンポーネントテスト</h1>
           
           <div class="instance-info">
-            <h3>インスタンス情報</h3>
-            <p><strong>インスタンスID:</strong> ${instanceId}</p>
+            <h3>セッション情報</h3>
             <p><strong>セッションID:</strong> ${req.session.id}</p>
             <p><strong>アクセス回数:</strong> ${req.session.views}</p>
+            <p><strong>最終アクセス:</strong> ${new Date().toLocaleString('ja-JP')}</p>
           </div>
           
           <div class="card" id="redis-card">

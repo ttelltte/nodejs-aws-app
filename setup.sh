@@ -8,7 +8,7 @@ REGION="ap-northeast-1"
 
 # 依存関係のインストール
 echo "依存関係をインストールしています..."
-npm install express express-session connect-redis redis mysql2 dotenv
+npm install express express-session connect-redis redis mysql2 dotenv morgan
 
 # Parameter Storeからエンドポイント情報を取得
 echo "AWS Parameter Storeから設定を取得しています..."

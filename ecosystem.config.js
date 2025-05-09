@@ -11,16 +11,18 @@ module.exports = {
       NODE_ENV: 'production',
       PORT: 3000
     },
+    // 環境変数はサーバー側の/etc/environmentから自動的に継承されるので
+    // 特別な設定は不要
     error_file: 'logs/pm2-error.log',
     out_file: 'logs/pm2-out.log',
     log_date_format: 'YYYY-MM-DD HH:mm:ss',
     merge_logs: true,
-    // 追加の再起動設定
-    restart_delay: 4000, // 再起動前の遅延（ms）
-    max_restarts: 10,    // 一定時間内の最大再起動回数
-    min_uptime: '30s',   // プロセスが異常とみなされる前の最小稼働時間
+    // 再起動設定
+    restart_delay: 4000,
+    max_restarts: 10,
+    min_uptime: '30s',
     // 優雅なシャットダウン
-    kill_timeout: 5000,  // SIGTERMシグナル送信後のkill -9までの時間（ms）
-    listen_timeout: 8000 // readyイベント待機時間
+    kill_timeout: 5000,
+    listen_timeout: 8000
   }]
 };

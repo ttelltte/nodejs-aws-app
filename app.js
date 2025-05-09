@@ -12,40 +12,57 @@ let redisClient = null;
 let dbPool = null;
 const EFS_MOUNT_POINT = '/mnt/efs';
 
-// 設定を取得
+// 環境変数から設定を取得
 const config = {
-  elasticache_endpoint: process.env.ELASTICACHE_ENDPOINT,
-  aurora_endpoint: process.env.AURORA_ENDPOINT,
-  aurora_username: process.env.AURORA_USERNAME,
-  aurora_password: process.env.AURORA_PASSWORD,
-  efs_mount_point: EFS_MOUNT_POINT
+  // 環境変数名を/etc/environmentに合わせて変更
+  elasticache_endpoint: process.env.CACHE_PRIMARY_ENDPOINT,
+  elasticache_reader_endpoint: process.env.CACHE_READER_ENDPOINT,
+  aurora_writer_endpoint: process.env.AURORA_WRITER_ENDPOINT,
+  aurora_reader_endpoint: process.env.AURORA_READER_ENDPOINT,
+  // ユーザー名とパスワードはまだ必要
+  aurora_username: process.env.AURORA_USERNAME || 'admin',
+  aurora_password: process.env.AURORA_PASSWORD || '',
+  efs_mount_point: EFS_MOUNT_POINT,
+  efs_id: process.env.EFS_ID
 };
 
 // 起動関数
 async function bootstrap() {
   try {
-    console.log('設定:', config);
+    // 機密情報を除いた設定をログに出力
+    console.log('設定:', {
+      elasticache_endpoint: config.elasticache_endpoint,
+      elasticache_reader_endpoint: config.elasticache_reader_endpoint,
+      aurora_writer_endpoint: config.aurora_writer_endpoint,
+      aurora_reader_endpoint: config.aurora_reader_endpoint,
+      efs_mount_point: config.efs_mount_point,
+      efs_id: config.efs_id
+    });
     
     // Expressの初期化
     const app = express();
     app.use(express.json());
     app.use(express.urlencoded({ extended: true }));
 
-    // アクセスログの設定（ここに追加）
+    // アクセスログの設定
     const morgan = require('morgan');
-    // カスタムフォーマットでアクセスログを出力
     app.use(morgan(':remote-addr - :method :url :status :res[content-length] - :response-time ms [:date[iso]] :req[x-forwarded-for]'));
     
     // Redisクライアントの初期化
-    redisClient = createClient({
-      url: `redis://${config.elasticache_endpoint}`
-    });
-    
-    redisClient.on('error', (err) => {
-      console.error('Redisエラー:', err);
-    });
-    
     try {
+      console.log('Redisに接続しています...');
+      redisClient = createClient({
+        url: `redis://${config.elasticache_endpoint}`,
+        socket: {
+          connectTimeout: 10000,
+          reconnectStrategy: (retries) => Math.min(retries * 100, 3000)
+        }
+      });
+      
+      redisClient.on('error', (err) => {
+        console.error('Redisエラー:', err);
+      });
+      
       await redisClient.connect();
       console.log('Redisに接続しました');
     } catch (redisError) {
@@ -54,8 +71,8 @@ async function bootstrap() {
     
     // セッション設定
     app.use(session({
-      store: new RedisStore({ client: redisClient }),
-      secret: 'your-secret-key',
+      store: redisClient ? new RedisStore({ client: redisClient }) : null,
+      secret: process.env.SESSION_SECRET || 'your-secret-key',
       resave: false,
       saveUninitialized: false,
       cookie: { secure: false, maxAge: 86400000 } // 24時間
@@ -63,15 +80,18 @@ async function bootstrap() {
     
     // MySQLプールの初期化
     try {
+      console.log('データベースに接続しています...');
       dbPool = mysql.createPool({
-        host: config.aurora_endpoint,
+        host: config.aurora_writer_endpoint,
         user: config.aurora_username,
         password: config.aurora_password,
-        database: 'mysql',
+        database: 'mysql', // 既存のデータベースを使用
         waitForConnections: true,
         connectionLimit: 10,
-        queueLimit: 0
+        queueLimit: 0,
+        connectTimeout: 10000
       });
+      
       console.log('データベース接続プールを初期化しました');
     } catch (dbError) {
       console.error('データベース接続エラー:', dbError);
@@ -132,7 +152,8 @@ async function bootstrap() {
           
           <div class="card" id="redis-card">
             <h3>ElastiCache (Redis)</h3>
-            <p><strong>エンドポイント:</strong> ${config.elasticache_endpoint}</p>
+            <p><strong>Primaryエンドポイント:</strong> ${config.elasticache_endpoint}</p>
+            <p><strong>Readerエンドポイント:</strong> ${config.elasticache_reader_endpoint}</p>
             <p><strong>ステータス:</strong> <span id="redis-status">チェック中...</span></p>
             <button onclick="testRedis()">接続テスト</button>
             <div id="redis-result"></div>
@@ -140,7 +161,8 @@ async function bootstrap() {
           
           <div class="card" id="db-card">
             <h3>Aurora (MySQL)</h3>
-            <p><strong>エンドポイント:</strong> ${config.aurora_endpoint}</p>
+            <p><strong>Writerエンドポイント:</strong> ${config.aurora_writer_endpoint}</p>
+            <p><strong>Readerエンドポイント:</strong> ${config.aurora_reader_endpoint}</p>
             <p><strong>ステータス:</strong> <span id="db-status">チェック中...</span></p>
             <button onclick="testDatabase()">接続テスト</button>
             <div id="db-result"></div>
@@ -149,6 +171,7 @@ async function bootstrap() {
           <div class="card" id="efs-card">
             <h3>EFS ストレージ</h3>
             <p><strong>マウントポイント:</strong> ${config.efs_mount_point}</p>
+            <p><strong>ファイルシステムID:</strong> ${config.efs_id}</p>
             <p><strong>ステータス:</strong> <span id="efs-status">チェック中...</span></p>
             <button onclick="testEFS()">アクセステスト</button>
             <div id="efs-result"></div>
@@ -227,7 +250,21 @@ async function bootstrap() {
     // APIエンドポイント - Redis接続テスト
     app.get('/api/test/redis', async (req, res) => {
       try {
-        if (!redisClient.isReady) {
+        if (!redisClient || !redisClient.isReady) {
+          if (!redisClient) {
+            redisClient = createClient({
+              url: `redis://${config.elasticache_endpoint}`,
+              socket: {
+                connectTimeout: 10000,
+                reconnectStrategy: (retries) => Math.min(retries * 100, 3000)
+              }
+            });
+            
+            redisClient.on('error', (err) => {
+              console.error('Redisエラー:', err);
+            });
+          }
+          
           await redisClient.connect();
         }
         
@@ -253,7 +290,15 @@ async function bootstrap() {
     app.get('/api/test/database', async (req, res) => {
       try {
         if (!dbPool) {
-          throw new Error('データベース接続が初期化されていません');
+          dbPool = mysql.createPool({
+            host: config.aurora_writer_endpoint,
+            user: config.aurora_username,
+            password: config.aurora_password,
+            database: 'mysql',
+            waitForConnections: true,
+            connectionLimit: 10,
+            queueLimit: 0
+          });
         }
         
         const connection = await dbPool.getConnection();
@@ -303,7 +348,7 @@ async function bootstrap() {
     
     // サーバー起動
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       console.log(`サーバーが起動しました - ポート: ${PORT}`);
     });
     
@@ -316,9 +361,18 @@ async function bootstrap() {
 // プロセス終了時の処理
 process.on('SIGTERM', async () => {
   console.log('SIGTERMを受信しました...');
-  if (redisClient) await redisClient.quit();
+  if (redisClient && redisClient.isReady) await redisClient.quit();
   if (dbPool) await dbPool.end();
   process.exit(0);
+});
+
+// プロセスエラー時の処理
+process.on('uncaughtException', (error) => {
+  console.error('未処理の例外が発生しました:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('未処理のPromise拒否が発生しました:', reason);
 });
 
 // アプリケーション起動
